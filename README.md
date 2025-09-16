@@ -23,7 +23,7 @@ This project adapts the Snowflake/Databricks benchmark queries to run on MotherD
 
 ```bash
 # Clone this repository
-git clone https://github.com/yourusername/motherduck_benchmark.git
+git clone https://github.com/padak/motherduck_benchmark.git
 cd motherduck_benchmark
 
 # Clone the original benchmark repository for sample data
