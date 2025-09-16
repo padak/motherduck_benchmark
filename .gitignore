@@ -1,0 +1,4 @@
+Performance_Test_Snowflake_Databricks/*
+.venv/*
+__pycache__/*
+.env
