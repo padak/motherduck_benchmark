@@ -37,10 +37,12 @@ def parse_args() -> argparse.Namespace:
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""Examples:
-  python %(prog)s --init-db          # Initialize database and load data
-  python %(prog)s --query-all        # Run all benchmark queries
-  python %(prog)s --query 01         # Run only Query 01
-  python %(prog)s --query 01 05 10   # Run queries 01, 05, and 10
+  python %(prog)s --init-db                      # Initialize database and load data
+  python %(prog)s --query-all                    # Run all benchmark queries
+  python %(prog)s --query 01                     # Run only Query 01
+  python %(prog)s --query 01 05 10               # Run queries 01, 05, and 10
+  python %(prog)s --query-all --profile          # Run with detailed resource profiling
+  python %(prog)s --query 01 --explain --profile # Show query plan and resource usage
 """,
     )
 
@@ -92,6 +94,11 @@ def parse_args() -> argparse.Namespace:
         "--show-storage",
         action="store_true",
         help="Show storage usage information for all databases",
+    )
+    action_group.add_argument(
+        "--profile",
+        action="store_true",
+        help="Enable detailed resource profiling for queries (memory, temp files, etc.)",
     )
 
     # Configuration arguments
@@ -523,6 +530,73 @@ def scale_table(
         print(f"⏱️  Failed after {elapsed:.2f} seconds")
 
 
+def get_resource_metrics(con: duckdb.DuckDBPyConnection) -> Dict[str, any]:
+    """Get current resource usage metrics."""
+    metrics = {}
+
+    try:
+        # Memory usage
+        memory_result = con.execute("SELECT current_memory(), peak_memory()").fetchone()
+        if memory_result:
+            metrics['current_memory_mb'] = memory_result[0] / (1024 * 1024) if memory_result[0] else 0
+            metrics['peak_memory_mb'] = memory_result[1] / (1024 * 1024) if memory_result[1] else 0
+    except:
+        metrics['current_memory_mb'] = 0
+        metrics['peak_memory_mb'] = 0
+
+    try:
+        # Temporary files (indicates spilling to disk)
+        temp_files = con.execute("SELECT COUNT(*) as count, COALESCE(SUM(size), 0) as total_size FROM duckdb_temporary_files()").fetchone()
+        if temp_files:
+            metrics['temp_files_count'] = temp_files[0]
+            metrics['temp_files_mb'] = temp_files[1] / (1024 * 1024) if temp_files[1] else 0
+    except:
+        metrics['temp_files_count'] = 0
+        metrics['temp_files_mb'] = 0
+
+    try:
+        # Database and buffer pool info
+        db_info = con.execute("SELECT * FROM duckdb_databases() WHERE database_name = current_database()").fetchone()
+        if db_info:
+            metrics['database_size_mb'] = db_info[2] / (1024 * 1024) if db_info[2] else 0
+    except:
+        metrics['database_size_mb'] = 0
+
+    return metrics
+
+
+def parse_profiling_output(con: duckdb.DuckDBPyConnection) -> Dict[str, any]:
+    """Parse the profiling output from DuckDB."""
+    profile_data = {}
+
+    try:
+        # Get the last query profiling information
+        profiling_result = con.execute("PRAGMA show_last_query_profiling").fetchall()
+
+        if profiling_result:
+            # Parse the profiling tree
+            for row in profiling_result:
+                if len(row) >= 2:
+                    # Extract timing information
+                    if "Total Time" in str(row):
+                        profile_data['total_time'] = str(row)
+                    elif "Cardinality" in str(row):
+                        profile_data['rows_processed'] = str(row)
+
+        # Try to get more detailed metrics
+        try:
+            json_profile = con.execute("PRAGMA profiling_output").fetchone()
+            if json_profile:
+                profile_data['detailed_profile'] = json_profile[0]
+        except:
+            pass
+
+    except Exception as e:
+        profile_data['error'] = str(e)
+
+    return profile_data
+
+
 def extract_labeled_statements(sql_text: str) -> List[Tuple[str, str]]:
     statements: List[Tuple[str, str]] = []
     buffer: List[str] = []
@@ -579,8 +653,15 @@ def run_queries(
     preview_rows: int,
     explain: bool = False,
     verbose: bool = False,
-) -> List[Tuple[str, float, int | None]]:
-    results: List[Tuple[str, float, int | None]] = []
+    profile: bool = False,
+) -> List[Tuple[str, float, int | None, Dict[str, any]]]:
+    results: List[Tuple[str, float, int | None, Dict[str, any]]] = []
+
+    # Enable profiling if requested
+    if profile:
+        con.execute("PRAGMA enable_profiling")
+        con.execute("PRAGMA profiling_mode = 'detailed'")
+        print("\n📊 Resource profiling enabled")
 
     for label, statement in statements:
         print(f"\n{'='*60}")
@@ -601,51 +682,154 @@ def run_queries(
                 for line in lines:
                     print(f"  {line}")
 
-        # Run EXPLAIN if requested
+        # Get resource metrics before query (if profiling)
+        metrics_before = get_resource_metrics(con) if profile else {}
+
+        # Determine which query to run
         if explain:
-            print("\n📊 Query Plan:")
-            explain_stmt = f"EXPLAIN ANALYZE {statement}"
-            try:
-                explain_result = con.execute(explain_stmt).fetchall()
-                # DuckDB returns EXPLAIN as (key, value) tuples
-                # The actual plan is in the 'value' column
+            # Use EXPLAIN ANALYZE which runs the query and provides plan + timing
+            print("\n📊 Running with EXPLAIN ANALYZE (executes query once)...")
+            query_to_run = f"EXPLAIN ANALYZE {statement}"
+            is_explain = True
+        else:
+            # Run normal query
+            print(f"\n⏱️  Executing...")
+            query_to_run = statement
+            is_explain = False
+
+        # Execute the query (either normal or EXPLAIN ANALYZE)
+        start = time.perf_counter()
+        cursor = con.execute(query_to_run)
+        rowcount: int | None = None
+
+        # Handle EXPLAIN ANALYZE output
+        if is_explain:
+            explain_result = cursor.fetchall()
+            elapsed = time.perf_counter() - start
+
+            print("\n📊 Query Plan with Execution Statistics:")
+            # Parse the explain output to find actual execution time
+            actual_query_time = elapsed  # Default to measured time
+
+            for row in explain_result:
+                if isinstance(row, tuple) and len(row) >= 2:
+                    value = row[1]
+                    if value:
+                        # Look for total time in the output
+                        if "Total Time:" in value:
+                            import re
+                            time_match = re.search(r'Total Time:\s*([\d.]+)s', value)
+                            if time_match:
+                                actual_query_time = float(time_match.group(1))
+
+                        # Print the plan
+                        for line in value.split('\n'):
+                            print(f"  {line}")
+
+            # Update elapsed with actual query time from EXPLAIN ANALYZE
+            elapsed = actual_query_time
+
+            # For EXPLAIN ANALYZE, we can't get row preview
+            rowcount = None
+        else:
+            # Normal query execution - handle results
+            if cursor.description:
+                if preview_rows > 0:
+                    rows = cursor.fetchmany(preview_rows)
+                    rowcount = len(rows)
+                    print(f"\n📋 Preview (first {rowcount} rows):")
+                    # Show column headers
+                    headers = [desc[0] for desc in cursor.description]
+                    print(f"  {' | '.join(headers[:5])}{'...' if len(headers) > 5 else ''}")
+                    print(f"  {'-' * 50}")
+                    # Show first few rows
+                    for i, row in enumerate(rows[:3]):
+                        row_str = ' | '.join(str(val)[:20] for val in row[:5])
+                        print(f"  {row_str}{'...' if len(row) > 5 else ''}")
+                    if rowcount > 3:
+                        print(f"  ... ({rowcount - 3} more rows)")
+                else:
+                    cursor.fetchone()
+
+            # Calculate elapsed time for normal query
+            elapsed = time.perf_counter() - start
+
+        # Collect resource metrics if profiling
+        resource_data = {}
+        if profile:
+            metrics_after = get_resource_metrics(con)
+
+            # Calculate deltas
+            resource_data = {
+                'memory_used_mb': metrics_after['current_memory_mb'] - metrics_before.get('current_memory_mb', 0),
+                'peak_memory_mb': metrics_after['peak_memory_mb'],
+                'temp_files_count': metrics_after['temp_files_count'],
+                'temp_files_mb': metrics_after['temp_files_mb'],
+                'spilled_to_disk': metrics_after['temp_files_count'] > 0
+            }
+
+            # Get profiling details
+            profile_data = parse_profiling_output(con)
+            resource_data['profile_details'] = profile_data
+
+            # Display resource usage
+            print(f"\n📊 Resource Usage:")
+            print(f"  • Memory used: {resource_data['memory_used_mb']:.2f} MB")
+            print(f"  • Peak memory: {resource_data['peak_memory_mb']:.2f} MB")
+
+            if resource_data['spilled_to_disk']:
+                print(f"  • ⚠️  Spilled to disk: {resource_data['temp_files_count']} files ({resource_data['temp_files_mb']:.2f} MB)")
+            else:
+                print(f"  • ✅ No disk spilling")
+
+            # If we already ran EXPLAIN ANALYZE, extract rows scanned from there
+            if is_explain and 'explain_result' in locals():
+                total_rows_scanned = 0
                 for row in explain_result:
                     if isinstance(row, tuple) and len(row) >= 2:
-                        key = row[0]
-                        value = row[1]
-                        # Skip the key, just print the formatted plan
-                        if value:
-                            # Print each line of the plan with proper indentation
-                            for line in value.split('\n'):
-                                print(f"  {line}")
-            except Exception as e:
-                print(f"  ⚠️  Could not explain query: {e}")
+                        value = str(row[1])
+                        # Look for rows information in the plan
+                        if "Rows" in value:
+                            import re
+                            # Look for patterns like "24000000000 Rows"
+                            matches = re.findall(r'(\d+)\s+Rows', value)
+                            if matches:
+                                # Get the largest row count (usually the table scan)
+                                for match in matches:
+                                    total_rows_scanned = max(total_rows_scanned, int(match))
 
-        # Run the actual query
-        print(f"\n⏱️  Executing...")
-        start = time.perf_counter()
-        cursor = con.execute(statement)
-        rowcount: int | None = None
-        if cursor.description:
-            if preview_rows > 0:
-                rows = cursor.fetchmany(preview_rows)
-                rowcount = len(rows)
-                print(f"\n📋 Preview (first {rowcount} rows):")
-                # Show column headers
-                headers = [desc[0] for desc in cursor.description]
-                print(f"  {' | '.join(headers[:5])}{'...' if len(headers) > 5 else ''}")
-                print(f"  {'-' * 50}")
-                # Show first few rows
-                for i, row in enumerate(rows[:3]):
-                    row_str = ' | '.join(str(val)[:20] for val in row[:5])
-                    print(f"  {row_str}{'...' if len(row) > 5 else ''}")
-                if rowcount > 3:
-                    print(f"  ... ({rowcount - 3} more rows)")
-            else:
-                cursor.fetchone()
+                if total_rows_scanned > 0:
+                    resource_data['rows_scanned'] = total_rows_scanned
+                    print(f"  • Rows scanned: {total_rows_scanned:,}")
 
-        elapsed = time.perf_counter() - start
-        results.append((label, elapsed, rowcount))
+            elif not is_explain:
+                # Only run a separate EXPLAIN if we haven't already
+                try:
+                    # Use simple EXPLAIN (not ANALYZE) to get estimated rows
+                    explain_stmt = f"EXPLAIN {statement}"
+                    explain_result = con.execute(explain_stmt).fetchall()
+                    total_rows_scanned = 0
+                    for row in explain_result:
+                        if isinstance(row, tuple) and len(row) >= 2:
+                            value = str(row[1])
+                            if "rows" in value.lower():
+                                import re
+                                matches = re.findall(r'rows=(\d+)', value.lower())
+                                if matches:
+                                    total_rows_scanned = max(total_rows_scanned, int(matches[0]))
+
+                    if total_rows_scanned > 0:
+                        resource_data['rows_scanned'] = total_rows_scanned
+                        print(f"  • Estimated rows to scan: {total_rows_scanned:,}")
+
+                        # Calculate efficiency if we have rowcount
+                        if rowcount and rowcount > 0:
+                            efficiency = (rowcount / total_rows_scanned) * 100 if total_rows_scanned > 0 else 0
+                            print(f"  • Scan efficiency: {efficiency:.2f}% (returned {rowcount:,} of {total_rows_scanned:,} scanned)")
+                except:
+                    pass
+
+        results.append((label, elapsed, rowcount, resource_data))
         print(f"\n✅ Completed in {elapsed:.3f} seconds")
 
     return results
@@ -712,39 +896,78 @@ def main() -> None:
             if not statements:
                 raise SystemExit(f"No queries found matching: {', '.join(args.query)}")
 
-        results = run_queries(con, statements, args.preview_rows, args.explain, args.verbose)
+        results = run_queries(con, statements, args.preview_rows, args.explain, args.verbose, args.profile)
 
         print(f"\n{'='*60}")
         print("📈 BENCHMARK SUMMARY")
         print(f"{'='*60}")
-        total_time = sum(elapsed for _, elapsed, _ in results)
+        total_time = sum(elapsed for _, elapsed, _, _ in results)
         print(f"\n⏱️  Total execution time: {total_time:.3f} seconds")
         print(f"📊 Queries executed: {len(results)}")
 
         if len(results) > 0:
             avg_time = total_time / len(results)
-            min_time = min(elapsed for _, elapsed, _ in results)
-            max_time = max(elapsed for _, elapsed, _ in results)
+            min_time = min(elapsed for _, elapsed, _, _ in results)
+            max_time = max(elapsed for _, elapsed, _, _ in results)
 
             print(f"\n📉 Statistics:")
             print(f"  • Average: {avg_time:.3f}s")
             print(f"  • Fastest: {min_time:.3f}s")
             print(f"  • Slowest: {max_time:.3f}s")
 
+            # Resource statistics if profiling was enabled
+            if args.profile:
+                print(f"\n💾 Resource Statistics:")
+
+                # Memory statistics
+                peak_memories = [r[3]['peak_memory_mb'] for _, _, _, r in results if r]
+                if peak_memories:
+                    print(f"  • Peak memory usage: {max(peak_memories):.2f} MB")
+                    print(f"  • Average memory: {sum(peak_memories) / len(peak_memories):.2f} MB")
+
+                # Disk spilling statistics
+                spilled_queries = [label for label, _, _, r in results if r and r.get('spilled_to_disk')]
+                if spilled_queries:
+                    print(f"  • ⚠️  Queries that spilled to disk: {', '.join(spilled_queries)}")
+                    total_spill = sum(r[3]['temp_files_mb'] for _, _, _, r in results if r and r.get('spilled_to_disk'))
+                    print(f"  • Total disk spill: {total_spill:.2f} MB")
+                else:
+                    print(f"  • ✅ No queries spilled to disk")
+
+                # Scan efficiency
+                efficiencies = []
+                for label, _, rowcount, resource_data in results:
+                    if resource_data and 'rows_scanned' in resource_data and rowcount:
+                        efficiency = (rowcount / resource_data['rows_scanned']) * 100 if resource_data['rows_scanned'] > 0 else 0
+                        efficiencies.append((label, efficiency))
+
+                if efficiencies:
+                    print(f"\n📊 Scan Efficiency (returned/scanned):")
+                    for label, eff in sorted(efficiencies, key=lambda x: x[1], reverse=True)[:5]:
+                        print(f"  • {label}: {eff:.2f}%")
+
         print(f"\n📋 Individual Results:")
-        for label, elapsed, rowcount in results:
+        for label, elapsed, rowcount, resource_data in results:
             suffix = f" (previewed {rowcount} rows)" if rowcount is not None else ""
             # Add performance indicator
             if len(results) > 1:
-                if elapsed == min(e for _, e, _ in results):
+                if elapsed == min(e for _, e, _, _ in results):
                     perf = " 🚀"
-                elif elapsed == max(e for _, e, _ in results):
+                elif elapsed == max(e for _, e, _, _ in results):
                     perf = " 🐌"
                 else:
                     perf = ""
             else:
                 perf = ""
-            print(f"  • {label}: {elapsed:.3f}s{suffix}{perf}")
+
+            # Add resource info if profiling
+            resource_suffix = ""
+            if args.profile and resource_data:
+                mem = resource_data.get('peak_memory_mb', 0)
+                spilled = "💾" if resource_data.get('spilled_to_disk') else ""
+                resource_suffix = f" [{mem:.0f}MB {spilled}]"
+
+            print(f"  • {label}: {elapsed:.3f}s{suffix}{perf}{resource_suffix}")
 
 
 if __name__ == "__main__":

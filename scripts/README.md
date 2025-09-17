@@ -62,95 +62,35 @@ python scripts/test_explain.py
 
 ## Scaling Scripts
 
-### scale_further.py
-
-**Purpose**: Scale an already-scaled table by a multiplication factor
-
-**Why we made it**: The main script's `--scale-table` starts from the 240k base table. When building incrementally (e.g., scaling from 2.4B to 24B), starting over is inefficient.
-
-**Features**:
-- Works with existing scaled tables (not starting from scratch)
-- Shows current and target row counts
-- Provides warnings for very large operations (>10B rows)
-- Replaces the original table atomically
-
-**Usage**:
-```bash
-# Scale current table by 10x
-python scripts/scale_further.py 10
-```
-
-**When to use**:
-- Incremental scaling (e.g., 240M → 2.4B → 24B)
-- Testing different scale factors without starting over
-- When you've already partially scaled and want to continue
-
-### scale_to_24b.py
-
-**Purpose**: Scale from exactly 19.2B rows to 24B rows
-
-**Why we made it**: During benchmarking, we had 19.2B rows and needed exactly 24B. This script adds precisely 4.8B rows.
-
-**Features**:
-- Calculates exact rows needed
-- Creates temporary 4.8B row table
-- Uses UNION ALL for efficient combination
-- Progress tracking with timing
-- Automatic cleanup on error
-
-**Usage**:
-```bash
-python scripts/scale_to_24b.py
-```
-
-**When to use**:
-- Final scaling step to reach exactly 24B rows
-- When you have 19.2B and need to reach the benchmark target
-
-### scale_with_union.py
-
-**Purpose**: Scale tables using UNION ALL instead of CROSS JOIN
-
-**Why we made it**: CROSS JOIN creates Cartesian products that explode memory usage. UNION ALL is much more memory-efficient for large-scale operations.
-
-**Features**:
-- Two strategies: recursive (doubling) and iterative
-- Recursive: 1x → 2x → 4x → 8x (efficient for powers of 2)
-- Iterative: Builds with single UNION ALL query
-- Shows progress and timing
-
-**Usage**:
-```bash
-# Recursive strategy (default)
-python scripts/scale_with_union.py 10 recursive
-
-# Iterative strategy
-python scripts/scale_with_union.py 10 iterative
-```
-
-**When to use**:
-- When CROSS JOIN causes memory/timeout issues
-- Scaling by powers of 2 (use recursive)
-- Need more control over memory usage
+> **Note**: We've consolidated all Python scaling functionality into `optimized_scale_to_24b.py` which supersedes 5 previous scripts (scale_further.py, scale_to_24b.py, scale_with_union.py, incremental_scale_to_24b.py, scale_to_24b.sql). This single script handles all scaling scenarios efficiently with UNION ALL, temp table reuse, and automatic rounding. For SQL-only users, `simple_union_scale.sql` provides a manual alternative.
 
 ### optimized_scale_to_24b.py
 
-**Purpose**: Efficiently scale to 24B rows by building a reusable 1B row temp table
+**Purpose**: Efficiently scale to EXACTLY 24B rows with precise row counting and optimized table building
 
-**Why we made it**: Previous incremental approaches rebuilt temp tables from scratch for each batch, wasting time. This optimized version builds a 1B row table ONCE and reuses it for all insertions.
+**Why we made it**: Previous incremental approaches rebuilt temp tables from scratch for each batch, wasting time. This optimized version builds a 1B row table ONCE and reuses it for all insertions, with precision adjustments to reach exactly 24B rows.
 
 **Features**:
 - Checks current table size and calculates exact batches needed
 - **Rounding Phase**: Automatically rounds current row count to nearest billion
   - If not on billion boundary, adds rows to reach next billion
   - Example: 11.976B → adds 24M rows → 12B
-- **Temp Table Reuse**: Builds 1B row temp table once using progressive UNION ALL
-  - 10x (2.4M) → 100x (24M) → 1000x (240M) → 1B
-  - Checks if temp_1b already exists and reuses it
+  - For large adjustments (e.g., 192M for 23.808B→24B), uses optimized progressive building
+- **Precise 1B Table**: Builds temp_1b with EXACTLY 1,000,000,000 rows
+  - 960M base (4×240M) + 40M precise addition (166×240k + 160k using LIMIT)
+  - Verifies exact count and rebuilds if existing temp_1b isn't exactly 1B
 - **Batch Insertion**: Reuses the same 1B table for all insertions
+- **Final Precision Adjustment**: After billion-row batches, adds exact remaining rows
+  - Calculates shortfall and builds precise adjustment table
+  - Uses LIMIT for partial rows when needed
 - 15-second cooldown between batches (prevents timeouts)
 - Option to keep temp_1b table for future scaling operations
 - Progress tracking with timestamps and percentages
+
+**Optimization for Large Multipliers**:
+- For 192M rows (800×240k), uses 3-step progressive building instead of 800 iterations:
+  - 10x (2.4M) → 100x (24M) → 800x (192M)
+  - Exponentially faster than iterative approach
 
 **Usage**:
 ```bash
@@ -168,26 +108,34 @@ flowchart TD
     IsTarget -->|No| CheckBillion{On billion boundary?}
 
     CheckBillion -->|No| Round[Round to nearest billion]
-    Round --> CreateSmall[Create small temp table]
+    Round --> CheckLarge{Large adjustment?>100M?}
+    CheckLarge -->|Yes| Optimized[Optimized progressive build<br/>10x→100x→800x]
+    CheckLarge -->|No| CreateSmall[Create rounding table]
+    Optimized --> InsertRound
     CreateSmall --> InsertRound[Insert rounding rows]
     InsertRound --> CleanRound[Drop temp_round]
     CleanRound --> CalcBatches
 
     CheckBillion -->|Yes| CalcBatches[Calculate billions needed]
 
-    CalcBatches --> CheckTemp{temp_1b exists?}
-    CheckTemp -->|Yes| VerifySize{Size = 1B?}
+    CalcBatches --> NeedBatches{Billions needed > 0?}
+    NeedBatches -->|No| FinalPrecision
+    NeedBatches -->|Yes| CheckTemp{temp_1b exists?}
+
+    CheckTemp -->|Yes| VerifySize{Size exactly 1B?}
     VerifySize -->|No| DropOld[Drop old temp_1b]
     DropOld --> Build1B
     VerifySize -->|Yes| StartLoop
 
-    CheckTemp -->|No| Build1B[Build 1B table progressively]
+    CheckTemp -->|No| Build1B[Build PRECISE 1B table]
 
-    Build1B --> Build10x[Build temp_10x: 2.4M rows]
-    Build10x --> Build100x[Build temp_100x: 24M rows]
-    Build100x --> Build1000x[Build temp_1000x: 240M rows]
-    Build1000x --> BuildFinal[Build temp_1b: 1B rows]
-    BuildFinal --> CleanIntermediate[Clean intermediate tables]
+    Build1B --> Build10x[Build 10x: 2.4M rows]
+    Build10x --> Build100x[Build 100x: 24M rows]
+    Build100x --> Build1000x[Build 1000x: 240M rows]
+    Build1000x --> Build960M[Build 4×240M = 960M]
+    Build960M --> Add40M[Add 166×240k + 160k LIMIT]
+    Add40M --> VerifyExact[Verify exactly 1B rows]
+    VerifyExact --> CleanIntermediate[Clean intermediate tables]
 
     CleanIntermediate --> StartLoop[Start insertion loop]
 
@@ -198,12 +146,22 @@ flowchart TD
     MoreBatches -->|Yes| Cooldown[Wait 15 seconds]
     Cooldown --> InsertBatch
 
-    MoreBatches -->|No| KeepTemp{Keep temp_1b?}
+    MoreBatches -->|No| FinalPrecision[Final precision check]
+
+    FinalPrecision --> NeedAdjust{Need adjustment<br/>to reach exactly 24B?}
+    NeedAdjust -->|Yes| CalcAdjust[Calculate exact shortfall]
+    CalcAdjust --> BuildAdjust[Build adjustment table<br/>with LIMIT if needed]
+    BuildAdjust --> InsertAdjust[Insert final adjustment]
+    InsertAdjust --> Cleanup
+
+    NeedAdjust -->|No| Cleanup[Cleanup phase]
+
+    Cleanup --> KeepTemp{Keep temp_1b?}
     KeepTemp -->|Yes| UpdateView
     KeepTemp -->|No| DropTemp[Drop temp_1b]
     DropTemp --> UpdateView[Update view]
 
-    UpdateView --> FinalStats[Show final statistics]
+    UpdateView --> FinalStats[Show final statistics<br/>EXACTLY 24B achieved!]
     FinalStats --> End([End])
 
     style Start fill:#e1f5e1
@@ -211,8 +169,12 @@ flowchart TD
     style End fill:#e1f5e1
     style Round fill:#fff3cd
     style Build1B fill:#cfe2ff
+    style Add40M fill:#ffcccc
+    style FinalPrecision fill:#ffcccc
+    style BuildAdjust fill:#ffcccc
     style InsertBatch fill:#d1ecf1
     style Cooldown fill:#f8d7da
+    style Optimized fill:#fff3cd
 ```
 
 **When to use**:
@@ -238,17 +200,6 @@ flowchart TD
 
 **Usage**: Choose option based on available memory, execute in UI
 
-### scale_to_24b.sql
-
-**Purpose**: Direct SQL to scale from 19.2B to exactly 24B rows
-
-**Why we made it**: Simple SQL alternative to the Python script for the final scaling step.
-
-**Features**:
-- Creates 4.8B row temporary table (240k × 20,000)
-- Combines with existing 19.2B using UNION ALL
-- Atomic table replacement
-- View update included
 
 ---
 
@@ -256,7 +207,7 @@ flowchart TD
 
 ### Timeout Errors
 **Issue**: "Your request timed out, the MotherDuck servers took too long"
-**Solution**: Use incremental scaling scripts with cooldown periods
+**Solution**: Use `optimized_scale_to_24b.py` with built-in cooldown periods
 
 ### Memory Issues
 **Issue**: Running out of temp disk space
@@ -282,6 +233,28 @@ flowchart TD
 
 ---
 
+## Current Script Inventory
+
+After consolidation, we maintain a minimal set of 4 essential scripts:
+
+| Script | Type | Purpose |
+|--------|------|---------|
+| `test_motherduck_connection.py` | Testing | Validate MotherDuck connection & diagnose issues |
+| `test_explain.py` | Testing | Debug DuckDB EXPLAIN output format |
+| `optimized_scale_to_24b.py` | Scaling | Comprehensive scaling solution (replaces 5 scripts) |
+| `simple_union_scale.sql` | Scaling | SQL-only alternative for UI users |
+
+### Scripts Consolidated/Removed
+
+The following scripts were removed as `optimized_scale_to_24b.py` provides superior functionality:
+- ~~`scale_further.py`~~ - Used inefficient CROSS JOIN
+- ~~`scale_to_24b.py`~~ - Used CROSS JOIN, too specific
+- ~~`scale_with_union.py`~~ - Features integrated into optimized version
+- ~~`incremental_scale_to_24b.py`~~ - Inefficiently rebuilt temp tables
+- ~~`scale_to_24b.sql`~~ - CROSS JOIN based, narrow use case
+- ~~`investigate_views.py`~~ - Caused hanging queries
+- ~~`check_views.py`~~ - Also caused hanging queries
+
 ## Adding New Scripts
 
 When adding new utility scripts:
@@ -296,3 +269,4 @@ When adding new utility scripts:
    - Features and usage
    - When to use it
    - Any warnings or limitations
+7. Consider if functionality could be added to existing scripts instead
