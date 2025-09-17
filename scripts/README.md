@@ -133,66 +133,98 @@ python scripts/scale_with_union.py 10 iterative
 - Scaling by powers of 2 (use recursive)
 - Need more control over memory usage
 
-### incremental_scale_to_24b.py
+### optimized_scale_to_24b.py
 
-**Purpose**: Scale from 9.6B to 24B rows with cooldown periods between batches
+**Purpose**: Efficiently scale to 24B rows by building a reusable 1B row temp table
 
-**Why we made it**: Direct scaling to 24B caused MotherDuck timeout errors ("DEADLINE_EXCEEDED"). This script adds data in manageable chunks with pauses.
+**Why we made it**: Previous incremental approaches rebuilt temp tables from scratch for each batch, wasting time. This optimized version builds a 1B row table ONCE and reuses it for all insertions.
 
 **Features**:
-- Adds 1.4B rows first, then 13 batches of 1B each
+- Checks current table size and calculates exact batches needed
+- **Rounding Phase**: Automatically rounds current row count to nearest billion
+  - If not on billion boundary, adds rows to reach next billion
+  - Example: 11.976B → adds 24M rows → 12B
+- **Temp Table Reuse**: Builds 1B row temp table once using progressive UNION ALL
+  - 10x (2.4M) → 100x (24M) → 1000x (240M) → 1B
+  - Checks if temp_1b already exists and reuses it
+- **Batch Insertion**: Reuses the same 1B table for all insertions
 - 15-second cooldown between batches (prevents timeouts)
-- Uses UNION ALL instead of CROSS JOIN (memory efficient)
-- Progress tracking with timestamps
-- Continues after batch failures
+- Option to keep temp_1b table for future scaling operations
+- Progress tracking with timestamps and percentages
 
 **Usage**:
 ```bash
-python scripts/incremental_scale_to_24b.py
+python scripts/optimized_scale_to_24b.py
+```
+
+**Workflow Diagram**:
+```mermaid
+flowchart TD
+    Start([Start]) --> Connect[Connect to MotherDuck]
+    Connect --> Check[Check current table size]
+
+    Check --> IsTarget{Current >= 24B?}
+    IsTarget -->|Yes| Done([Done - Already at target])
+    IsTarget -->|No| CheckBillion{On billion boundary?}
+
+    CheckBillion -->|No| Round[Round to nearest billion]
+    Round --> CreateSmall[Create small temp table]
+    CreateSmall --> InsertRound[Insert rounding rows]
+    InsertRound --> CleanRound[Drop temp_round]
+    CleanRound --> CalcBatches
+
+    CheckBillion -->|Yes| CalcBatches[Calculate billions needed]
+
+    CalcBatches --> CheckTemp{temp_1b exists?}
+    CheckTemp -->|Yes| VerifySize{Size = 1B?}
+    VerifySize -->|No| DropOld[Drop old temp_1b]
+    DropOld --> Build1B
+    VerifySize -->|Yes| StartLoop
+
+    CheckTemp -->|No| Build1B[Build 1B table progressively]
+
+    Build1B --> Build10x[Build temp_10x: 2.4M rows]
+    Build10x --> Build100x[Build temp_100x: 24M rows]
+    Build100x --> Build1000x[Build temp_1000x: 240M rows]
+    Build1000x --> BuildFinal[Build temp_1b: 1B rows]
+    BuildFinal --> CleanIntermediate[Clean intermediate tables]
+
+    CleanIntermediate --> StartLoop[Start insertion loop]
+
+    StartLoop --> InsertBatch[Insert 1B from temp_1b]
+    InsertBatch --> UpdateCount[Update row count]
+    UpdateCount --> MoreBatches{More batches needed?}
+
+    MoreBatches -->|Yes| Cooldown[Wait 15 seconds]
+    Cooldown --> InsertBatch
+
+    MoreBatches -->|No| KeepTemp{Keep temp_1b?}
+    KeepTemp -->|Yes| UpdateView
+    KeepTemp -->|No| DropTemp[Drop temp_1b]
+    DropTemp --> UpdateView[Update view]
+
+    UpdateView --> FinalStats[Show final statistics]
+    FinalStats --> End([End])
+
+    style Start fill:#e1f5e1
+    style Done fill:#e1f5e1
+    style End fill:#e1f5e1
+    style Round fill:#fff3cd
+    style Build1B fill:#cfe2ff
+    style InsertBatch fill:#d1ecf1
+    style Cooldown fill:#f8d7da
 ```
 
 **When to use**:
-- Scaling to very large sizes (>10B rows)
-- When experiencing timeout errors with other methods
-- Need detailed progress tracking
-- Want automatic recovery from failures
+- Scaling to 24B rows from any starting point
+- When you need the most efficient scaling approach
+- Want to reuse temp tables for future operations
+- Need to minimize MotherDuck compute time
+- Have non-billion row counts that need rounding first
 
 ---
 
 ## SQL Scripts for Manual Execution
-
-### incremental_scale_to_24b.sql
-
-**Purpose**: SQL version of incremental scaling for manual execution in MotherDuck UI
-
-**Why we made it**: Some users prefer running SQL directly in the UI for better control and visibility.
-
-**Structure**:
-- 14 separate batch blocks
-- Each batch clearly marked with current → target row counts
-- Instructions to wait 15-30 seconds between batches
-- Verification queries after each batch
-
-**Usage**:
-1. Open MotherDuck UI
-2. Copy and execute each batch block separately
-3. Wait 15-30 seconds between batches
-4. Monitor row counts after each batch
-
-### incremental_scale_union_all.sql
-
-**Purpose**: Progressive UNION ALL approach building from 5x → 50x → 500x → 1.2B chunks
-
-**Why we made it**: CROSS JOIN is memory-intensive. This script builds progressively larger chunks using only UNION ALL.
-
-**Strategy**:
-1. Build 5x table (1.2M rows)
-2. Build 50x from 5x table (12M rows)
-3. Build 500x from 50x table (120M rows)
-4. Build final 1.2B chunk
-5. INSERT the chunk 12 times
-
-**Usage**: Execute sections sequentially in MotherDuck UI with pauses
 
 ### simple_union_scale.sql
 
