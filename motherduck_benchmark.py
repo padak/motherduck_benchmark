@@ -83,6 +83,16 @@ def parse_args() -> argparse.Namespace:
         type=int,
         help="Scale contoso_sales_240k table by given multiplier (e.g., 100000 for 24B rows)",
     )
+    action_group.add_argument(
+        "--use-union",
+        action="store_true",
+        help="Use UNION ALL instead of CROSS JOIN for scaling (more memory efficient)",
+    )
+    action_group.add_argument(
+        "--show-storage",
+        action="store_true",
+        help="Show storage usage information for all databases",
+    )
 
     # Configuration arguments
     config_group = parser.add_argument_group("configuration")
@@ -150,7 +160,7 @@ def parse_args() -> argparse.Namespace:
     args = parser.parse_args()
 
     # Show help if no action arguments provided
-    if not any([args.init_db, args.query_all, args.query, args.show_tables, args.scale_table]):
+    if not any([args.init_db, args.query_all, args.query, args.show_tables, args.scale_table, args.show_storage]):
         parser.print_help()
         parser.exit()
 
@@ -250,13 +260,19 @@ def show_tables(con: duckdb.DuckDBPyConnection, schema: str) -> None:
     print(f"📊 DATABASE TABLES in schema '{schema}'")
     print(f"{'='*60}\n")
 
-    # Get all tables and views
+    # Get all tables and views, excluding system views
+    # System views like database_snapshots, storage_info are in MD_INFORMATION_SCHEMA
     tables_query = f"""
     SELECT
         table_name,
         table_type
     FROM information_schema.tables
     WHERE table_schema = '{schema}'
+        AND table_name NOT IN (
+            'database_snapshots', 'databases', 'owned_shares',
+            'query_history', 'shared_with_me', 'storage_info',
+            'storage_info_history'
+        )
     ORDER BY table_type, table_name
     """
 
@@ -272,6 +288,12 @@ def show_tables(con: duckdb.DuckDBPyConnection, schema: str) -> None:
     total_rows = 0
     for table_name, table_type in tables:
         try:
+            # For views, check if they're actually queryable in this schema
+            if table_type == "VIEW":
+                # Try a simple query first to see if the view is accessible
+                test_query = f"SELECT 1 FROM {quote_identifier(schema)}.{quote_identifier(table_name)} LIMIT 1"
+                con.execute(test_query).fetchone()
+
             count_query = f"SELECT COUNT(*) FROM {quote_identifier(schema)}.{quote_identifier(table_name)}"
             row_count = con.execute(count_query).fetchone()[0]
             total_rows += row_count
@@ -284,16 +306,140 @@ def show_tables(con: duckdb.DuckDBPyConnection, schema: str) -> None:
 
             print(f"{emoji} {table_name:<28} {table_type:<10} {formatted_count:>14}")
         except Exception as e:
-            print(f"⚠️  {table_name:<28} {table_type:<10} {'Error: ' + str(e)[:20]}")
+            # Only show error for non-system views
+            error_msg = str(e)
+            if "Catalog Error" in error_msg and table_type == "VIEW":
+                # Skip system views that can't be accessed from this schema
+                continue
+            else:
+                print(f"⚠️  {table_name:<28} {table_type:<10} {'Error: ' + str(e)[:20]}")
 
     print("-" * 60)
     print(f"📈 Total rows across all tables: {total_rows:,}\n")
 
 
+def show_storage(con: duckdb.DuckDBPyConnection) -> None:
+    """Display storage usage information for all databases."""
+    print(f"\n{'='*80}")
+    print(f"💾 STORAGE USAGE INFORMATION")
+    print(f"{'='*80}\n")
+
+    try:
+        # Check if MD_INFORMATION_SCHEMA.STORAGE_INFO exists
+        storage_query = """
+        SELECT
+            database_name,
+            active_bytes,
+            kept_for_cloned_bytes,
+            failsafe_bytes,
+            (COALESCE(active_bytes, 0) + COALESCE(failsafe_bytes, 0) + COALESCE(kept_for_cloned_bytes, 0)) as total_bytes,
+            active_bytes / (1024.0 * 1024.0 * 1024.0) as active_gb,
+            kept_for_cloned_bytes / (1024.0 * 1024.0 * 1024.0) as cloned_gb,
+            failsafe_bytes / (1024.0 * 1024.0 * 1024.0) as failsafe_gb,
+            (COALESCE(active_bytes, 0) + COALESCE(failsafe_bytes, 0) + COALESCE(kept_for_cloned_bytes, 0)) / (1024.0 * 1024.0 * 1024.0) as total_gb
+        FROM MD_INFORMATION_SCHEMA.STORAGE_INFO
+        ORDER BY total_bytes DESC
+        """
+
+        storage_data = con.execute(storage_query).fetchall()
+
+        if not storage_data:
+            print("No storage information available.")
+            return
+
+        # Print header
+        print(f"{'Database':<25} {'Active':<12} {'Cloned':<12} {'Failsafe':<12} {'Total':<12}")
+        print(f"{'Name':<25} {'(GB)':<12} {'(GB)':<12} {'(GB)':<12} {'(GB)':<12}")
+        print("-" * 73)
+
+        total_active = 0
+        total_cloned = 0
+        total_failsafe = 0
+        total_total = 0
+
+        # Print each database
+        for row in storage_data:
+            db_name = row[0] or "(unknown)"
+            active_gb = row[5] or 0
+            cloned_gb = row[6] or 0
+            failsafe_gb = row[7] or 0
+            total_gb = row[8] or 0
+
+            # Accumulate totals
+            total_active += active_gb
+            total_cloned += cloned_gb
+            total_failsafe += failsafe_gb
+            total_total += total_gb
+
+            # Truncate long database names
+            if len(db_name) > 24:
+                db_name = db_name[:21] + "..."
+
+            print(f"{db_name:<25} {active_gb:>11.3f} {cloned_gb:>11.3f} {failsafe_gb:>11.3f} {total_gb:>11.3f}")
+
+        # Print totals
+        print("-" * 73)
+        print(f"{'TOTAL':<25} {total_active:>11.3f} {total_cloned:>11.3f} {total_failsafe:>11.3f} {total_total:>11.3f}")
+
+        # Storage lifecycle explanation
+        print(f"\n📊 Storage Categories:")
+        print(f"  • Active: Currently referenced data accessible by queries")
+        print(f"  • Cloned: Data kept for cloned databases or shares")
+        print(f"  • Failsafe: System backups retained for recovery (7 days)")
+
+        # Cost estimation
+        gb_days = total_total * 30  # Approximate monthly GB-days
+        monthly_cost = gb_days * 0.0025685  # $0.0025685 per GB-day
+        print(f"\n💵 Estimated Monthly Storage Cost:")
+        print(f"  • Total Storage: {total_total:.3f} GB")
+        print(f"  • Estimated GB-days (30-day month): {gb_days:.1f}")
+        print(f"  • Estimated Cost: ${monthly_cost:.2f}")
+
+        # Try to get historical data if available
+        print(f"\n📈 Recent Storage History (last 7 days):")
+        try:
+            history_query = """
+            SELECT
+                DATE(result_ts) as date,
+                SUM(total_bytes) / (1024.0 * 1024.0 * 1024.0) as total_gb
+            FROM MD_INFORMATION_SCHEMA.STORAGE_INFO_HISTORY
+            WHERE result_ts >= CURRENT_DATE - INTERVAL 7 DAY
+            GROUP BY DATE(result_ts)
+            ORDER BY date DESC
+            LIMIT 7
+            """
+
+            history_data = con.execute(history_query).fetchall()
+
+            if history_data:
+                print(f"  {'Date':<12} {'Total (GB)':>12}")
+                print(f"  {'-'*24}")
+                for date, gb in history_data:
+                    print(f"  {str(date):<12} {gb:>11.3f}")
+            else:
+                print("  No historical data available.")
+
+        except Exception:
+            print("  Historical data not accessible (may require admin privileges).")
+
+    except duckdb.CatalogException as e:
+        if "Table with name STORAGE_INFO does not exist" in str(e):
+            print("⚠️  Storage information is not available.")
+            print("    This feature requires:")
+            print("    1. Organization admin privileges")
+            print("    2. MotherDuck Business plan or higher")
+            print("    3. Connection to MotherDuck (not local DuckDB)")
+        else:
+            print(f"❌ Error accessing storage information: {e}")
+    except Exception as e:
+        print(f"❌ Unexpected error: {e}")
+
+
 def scale_table(
     con: duckdb.DuckDBPyConnection,
     schema: str,
-    multiplier: int
+    multiplier: int,
+    use_union: bool = False
 ) -> None:
     """Scale contoso_sales_240k table by creating a larger table."""
     print(f"\n{'='*60}")
@@ -323,21 +469,36 @@ def scale_table(
             return
 
     print(f"\n⏱️  Creating scaled table {target_table}...")
+    print(f"📋 Strategy: {'UNION ALL' if use_union else 'CROSS JOIN'}")
     print("This may take several minutes for large multipliers...\n")
 
-    # DuckDB-compatible scaling using CROSS JOIN with generate_series
-    scaling_query = f"""
-    CREATE OR REPLACE TABLE {target_table} AS
-    SELECT
-        original.*,
-        replicate_id
-    FROM {source_table} AS original
-    CROSS JOIN (
-        SELECT generate_series AS replicate_id
-        FROM generate_series(1, {multiplier})
-    ) AS replicator
-    ORDER BY order_date, store_id, product_id, replicate_id
-    """
+    if use_union:
+        # Memory-efficient UNION ALL approach
+        print("Using memory-efficient UNION ALL strategy...")
+
+        # Build UNION ALL query
+        union_parts = [f"SELECT * FROM {source_table}"]
+        for i in range(1, multiplier):
+            union_parts.append(f"UNION ALL SELECT * FROM {source_table}")
+
+        scaling_query = f"""
+        CREATE OR REPLACE TABLE {target_table} AS
+        {' '.join(union_parts)}
+        """
+    else:
+        # Original CROSS JOIN approach
+        scaling_query = f"""
+        CREATE OR REPLACE TABLE {target_table} AS
+        SELECT
+            original.*,
+            replicate_id
+        FROM {source_table} AS original
+        CROSS JOIN (
+            SELECT generate_series AS replicate_id
+            FROM generate_series(1, {multiplier})
+        ) AS replicator
+        ORDER BY order_date, store_id, product_id, replicate_id
+        """
 
     start_time = time.perf_counter()
     try:
@@ -532,7 +693,11 @@ def main() -> None:
 
     # Scale table if requested
     if args.scale_table:
-        scale_table(con, schema, args.scale_table)
+        scale_table(con, schema, args.scale_table, args.use_union)
+
+    # Show storage if requested
+    if args.show_storage:
+        show_storage(con)
 
     # Run queries if requested
     if args.query_all or args.query:

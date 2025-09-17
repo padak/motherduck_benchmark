@@ -59,6 +59,9 @@ python motherduck_benchmark.py --init-db
 
 # View loaded tables
 python motherduck_benchmark.py --show-tables
+
+# View storage usage information
+python motherduck_benchmark.py --show-storage
 ```
 
 ## Usage
@@ -108,6 +111,7 @@ python motherduck_benchmark.py --help
 Key options:
 - `--init-db`: Initialize database and load sample data
 - `--show-tables`: Display all tables with row counts
+- `--show-storage`: Display storage usage by database with lifecycle stages
 - `--scale-table MULTIPLIER`: Scale the contoso_sales_240k table
 - `--query-all`: Run all benchmark queries
 - `--query N [N ...]`: Run specific query numbers
@@ -172,8 +176,10 @@ The main CLI application provides comprehensive functionality for benchmark oper
 
 5. **Database Inspection**
    - `show_tables()`: Lists all tables/views with row counts
-   - Displays table types (BASE TABLE vs VIEW)
-   - Calculates total row count across database
+   - `show_storage()`: Displays storage usage by database with lifecycle stages
+   - Shows active, pending, deleted, and failsafe bytes
+   - Estimates monthly storage costs
+   - Displays 7-day storage history when available
 
 ### Configuration Options
 
